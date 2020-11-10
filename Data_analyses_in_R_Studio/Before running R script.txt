@@ -1,0 +1,1 @@
+Before running R script, extract the following .7z file in folder input data: Galaxy58-[NG-Tax__porcine_study_all_samples_eightrun_length70bp_11march2020]

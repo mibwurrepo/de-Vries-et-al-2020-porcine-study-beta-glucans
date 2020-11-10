@@ -1,0 +1,1864 @@
+---
+title: "Impact of Yeast-Derived Beta-Glucans on the Porcine Gut Microbiota and Immune System in Early Life"
+author: "Hugo de Vries & Mirelle Geervliet"
+date: "13 October 2020"
+output:
+  html_document:
+    theme: default
+    highlight: default
+    toc: true
+    collapsed: false
+    toc_float: true
+    toc_depth: 2
+---
+
+This HTML document contains the R-code that was used to perform analyses and create figures for the corresponding manuscript. At the end of the document the R version and package versions can be found. Should one want to run this R project in R-studio, it is advised to use the same R version and package versions as have been used here.
+
+# 1. Load R packages  
+```{r, warning=FALSE, message=FALSE}
+#Warnings and messages have been inactivated for this markdown
+library(phyloseq)
+library(microbiome)
+library(microbiomeutilities)
+library(ggplot2)
+library(ggpubr)
+library(plyr)
+library(dplyr)
+library(ape)
+library(reshape2)
+library(scales)
+library(knitr)
+library(ggrepel)
+library(nlme)
+library(lme4)
+library(sciplot)
+library(apeglm)
+library(pheatmap)
+library(decontam)
+library(Hmisc)
+library(picante)
+library(emmeans)
+library(multcomp)
+library(multcompView)
+library(data.table) 
+library(purrr) 
+library(viridis) 
+library(RColorBrewer)
+library(ALDEx2)
+library(compositions)
+library(zCompositions)
+library(CoDaSeq)
+library(propr)
+library(vegan)
+library(DT)
+library(DESeq2)
+library(psych)
+library(car)
+library(ggvegan)
+library(metamicrobiomeR)
+library(corrplot)
+library(tidyverse)
+library(rstatix)
+library(datarium)
+```
+
+# 2. Directory structure
+```{r, warning=FALSE, message=FALSE}
+# Create Folders as following
+
+# Figures 
+dir.create("figures")  
+
+# Phyloseq objects  
+dir.create("phyobjects")  
+
+# Phyloseq objects  
+dir.create("output_data")  
+```
+
+# 3. Data input and subsetting  
+## 3.1. Loading data  
+Loading Illumina sequencing data of library 1-14.
+Data was run through NGTax 2.0 and SILVA database version 132 was used as reference database.
+
+Create phyloseq object  
+```{r}
+# create phyloseq object of all libraries
+ps <- read_phyloseq(otu.file = "./input_data/Galaxy58-[NG-Tax__porcine_study_all_samples_eightrun_length70bp_11march2020].biom1", 
+                    taxonomy.file = NULL, 
+                    metadata.file = "./input_data/Metadata_porcine_study_june_2020_y_glucan.csv", 
+                    type = "biom")
+
+# create tree object
+treefile <- read.tree("./input_data/all_otus_eightrun_length70bp_11march2020.tre")
+# merge tree and phyloseq object
+ps1.all <- merge_phyloseq(ps,treefile)
+print(ps1.all)
+
+# export taxonomy table (for Windows)
+taxonomy_table_ps1 <- as.data.frame(ps1.all@tax_table)
+write.csv(taxonomy_table_ps1, file = "./output_data/taxonomy_table_ps1.csv", fileEncoding = "UTF-16LE") 
+ntaxa(ps1.all)
+```
+
+Remove pattern in taxa names  
+```{r}
+# remove pattern in taxa names
+tax_table(ps1.all)[,colnames(tax_table(ps1.all))] <- gsub(tax_table(ps1.all)[,colnames(tax_table(ps1.all))],pattern="[a-z]__",replacement="")
+
+```
+
+Export phyloseq object  
+```{r}
+# this is the raw, unfiltered phyloseq file
+saveRDS(ps1.all, "./phyobjects/ps1_all.rds")
+ps1.all <- readRDS("./phyobjects/ps1_all.rds")
+
+# create new object to work with
+ps1 <- ps1.all
+```
+
+## 3.2. Cleaning data  
+Removing mitochondrial and chloroplast reads
+```{r}
+# replace empty fields by "Unmatched_level" 
+# this is needed because otherwise the microbiome::aggregate_taxa() function will not run
+tax_table(ps1)[tax_table(ps1)[,"Phylum"]== "","Phylum"] <- "Unmatched_phylum"
+tax_table(ps1)[tax_table(ps1)[,"Class"]== "","Class"] <- "Unmatched_class"
+tax_table(ps1)[tax_table(ps1)[,"Order"]== "","Order"] <- "Unmatched_order"
+tax_table(ps1)[tax_table(ps1)[,"Family"]== "","Family"] <- "Unmatched_family"
+tax_table(ps1)[tax_table(ps1)[,"Genus"]== "","Genus"] <- "Unmatched_genus"
+
+# remove mitochondria and chloroplasts
+ps1 <- subset_taxa(ps1, Family != "Mitochondria")
+ps1 <- subset_taxa(ps1, Class != "Chloroplast") #No Chloroplasts found in class Chloroplasts
+
+ps1.mitoch <- subset_taxa(ps1.all, Family == "Mitochondria")
+ps1.mitoch <- prune_samples(sample_sums(ps1.mitoch)>0,ps1.mitoch) 
+sort(sample_sums(ps1.mitoch))
+
+# There are however Oxyphotobacteria (Dutch translation: blauwalgen) present in the dataset, which are not removed from the dataset:
+ps1.chloro <- subset_taxa(ps1.all, Order == "Chloroplast")
+ps1.chloro <- prune_samples(sample_sums(ps1.chloro)>0,ps1.chloro) 
+sort(sample_sums(ps1.chloro))
+
+print(ps1)
+
+ntaxa(ps1.all)-ntaxa(ps1) # 34 ASVs removed which were belonging to mitochondria
+```
+
+## 3.3. Decontaminating dataset  
+Remove contaminant reads, identified by visual inspection of each ASV individually using correlation plots [DNA_reading] vs rel. ASV abundance. Resulted in 8 ASVs identified as contaminants.
+```{r}
+# remove samples that have no reads. Does not do anything as in this dataset there are reads in every sample:
+psx <- prune_samples(sample_sums(ps1)>0,ps1) 
+
+# add higher taxa names
+psx.tax <- as.data.frame(psx@tax_table)
+psx.tax$OTU <- rownames(psx.tax)
+
+# import contaminant OTU table
+visContam <- read.delim("./input_data/Contaminant_OTU_by_visual_identification.txt",header=T)
+
+psx.tax2 <- psx.tax 
+rownames(psx.tax2) <- NULL # reset rownames for subset based on index
+psx.tax2$contam <- rownames(psx.tax2) %in% visContam$OTU
+table(psx.tax2$contam) # works: 8 OTUs T, rest F
+rownames(psx.tax2) <- psx.tax2$OTU # restore OTU as rownames
+psx.tax2$reads <- taxa_sums(psx)
+
+# calculate % contaminant reads
+contam.otu2 <- subset(psx.tax2, contam == "TRUE")
+(sum(contam.otu2$reads) / sum(abundances(psx)))
+# 0.0092% of all reads
+
+# subset phyloseq to contaminant OTUs
+psx.sub <- subset_taxa(psx, psx.tax2$contam)
+
+ps1.decontam <- prune_taxa(!psx.tax2$contam, ps1) 
+ps1.decontam
+ps1.decontam <- prune_samples(sample_sums(ps1.decontam)>0, ps1.decontam)
+ps1.decontam # 4115 taxa, 482 samples
+
+# samples with 0 reads after removing contaminants: 1 (water.blank.10)
+# (code in following 2 lines only runs if not running prune_samples command above, used to identify removed samples)
+#sample0 <- subset_samples(ps1.decontam, sample_sums(ps1.decontam)==0)
+#sample_data(sample0)
+
+ntaxa(ps1)-ntaxa(ps1.decontam)
+# 8 OTUs removed (resulting from the visual identification of contaminants)
+
+sum(abundances(ps1)) - sum(abundances(ps1.decontam))
+# 8244 reads removed.
+```
+
+## 3.4. Export phyloseq objects  
+```{r}
+# dataset without mitochondrial/chloroplast reads, but with contaminants
+saveRDS(ps1, "./phyobjects/ps1.rds")
+ps1 <- readRDS("./phyobjects/ps1.rds")
+
+# decontaminated dataset
+saveRDS(ps1.decontam, "./phyobjects/ps1.decontam.rds")
+ps1.decontam <- readRDS("./phyobjects/ps1.decontam.rds")
+```
+
+## 3.5. Subsetting
+```{r}
+# all following objects are without contaminant ASVs:
+ps1.unique <- subset_samples(ps1.decontam, Unique == "yes")
+ps1.noROM <- subset_samples(ps1.unique, Treatment != "ROM")
+ps1.glucan <- subset_samples(ps1.noROM, Treatment != "EcN")
+ps1.glucan <- prune_taxa(taxa_sums(otu_table(ps1.glucan))>0, ps1.glucan)
+ps1.faeces <- subset_samples(ps1.glucan, Origin == "faeces")
+ps1.faeces <- prune_taxa(taxa_sums(otu_table(ps1.faeces))>0, ps1.faeces)
+ps1.faeces.pre <- subset_samples(ps1.faeces, Pre_or_post_weaning == "Pre_weaning")
+ps1.faeces.pre <- prune_taxa(taxa_sums(otu_table(ps1.faeces.pre))>0, ps1.faeces.pre)
+ps1.faeces.post <- subset_samples(ps1.faeces, Pre_or_post_weaning == "Post_weaning")
+ps1.faeces.post <- prune_taxa(taxa_sums(otu_table(ps1.faeces.post))>0, ps1.faeces.post)
+ps1.digesta <- subset_samples(ps1.glucan, Origin %in% c("jejunum_digesta", "ileum_digesta", "caecum_digesta"))
+ps1.digesta <- prune_taxa(taxa_sums(otu_table(ps1.digesta))>0, ps1.digesta)
+ps1.jejunum.digesta <- subset_samples(ps1.glucan, Origin %in% c("jejunum_digesta"))
+ps1.jejunum.digesta <- prune_taxa(taxa_sums(otu_table(ps1.jejunum.digesta))>0, ps1.jejunum.digesta)
+ps1.ileum.digesta <- subset_samples(ps1.glucan, Origin %in% c("ileum_digesta"))
+ps1.ileum.digesta <- prune_taxa(taxa_sums(otu_table(ps1.ileum.digesta))>0, ps1.ileum.digesta)
+ps1.caecum.digesta <- subset_samples(ps1.glucan, Origin %in% c("caecum_digesta"))
+ps1.caecum.digesta <- prune_taxa(taxa_sums(otu_table(ps1.caecum.digesta))>0, ps1.caecum.digesta)
+ps1.swabs <- subset_samples(ps1.faeces, Swab %in% c("swab"))
+ps1.swabs <- prune_taxa(taxa_sums(otu_table(ps1.swabs))>0, ps1.swabs)
+ps1.no.swabs <- subset_samples(ps1.faeces, Swab %in% c("no_swab"))
+ps1.no.swabs <- prune_taxa(taxa_sums(otu_table(ps1.no.swabs))>0, ps1.no.swabs)
+print(ps1.faeces) # 287 samples
+
+# filter out archaea and place in phyloseq object
+ps1.archaea <- subset_taxa(ps1.glucan, Phylum == "Euryarchaeota")
+ps1.archaea
+```
+
+## 3.6. Subsetting for quality checks  
+```{r}
+#	negative controls - includes contaminant reads (ps1)
+ps1.contr <- subset_samples(ps1, Origin %in% c("blank"))
+ps1.contr <- prune_taxa(taxa_sums(otu_table(ps1.contr))>0, ps1.contr)
+print(ps1.contr)
+
+# positive controls (mocks) - with contaminant reads (ps1)
+ps1.mock <- subset_samples(ps1, Origin %in% c("mock.3","mock.4"))
+ps1.mock <- prune_taxa(taxa_sums(otu_table(ps1.mock))>0, ps1.mock)
+print(ps1.mock)
+
+# technical duplicates (PCR) - includes contaminant reads (ps1)
+ps1.tech <- subset_samples(ps1, Description %in% c("m1858", "m1858R1","m1858R2","m1858R3", "m2158", "m2158R1", "m2158R2", "m2158R3", "m169", "m169R1", "m169R2", "m169R3", "m169R4", "m169R5", "m169R6", "m924", "m924R1", "m924R2", "m924R3", "m924R4", "m924R5", "m924R6"))
+ps1.tech <- prune_taxa(taxa_sums(otu_table(ps1.tech))>0, ps1.tech)
+print(ps1.tech)
+
+#	subset mitochondrial sequences
+ps1.mit <- subset_taxa(ps1.all, Family == "Mitochondria")
+print(ps1.mit)
+
+# subset chloroplast sequences
+#ps1.chloro <- subset_taxa(ps1.all, Class == "Chloroplast") #does not run, since there do not seem to be chloroplast reads present
+```
+
+## 3.7. Save subsets  
+Saving subsets in compressed formats (RDS).
+```{r}
+# with contaminants
+saveRDS(ps1.decontam, "./phyobjects/ps1.decontam.rds")
+saveRDS(ps1.unique, "./phyobjects/ps1.unique.rds")
+saveRDS(ps1.all, "./phyobjects/ps1.all.rds")
+saveRDS(ps1.tech, "./phyobjects/ps1.tech.rds")
+saveRDS(ps1.contr, "./phyobjects/ps1.contr.rds")
+saveRDS(ps1.mock, "./phyobjects/ps1.mock.rds")
+saveRDS(ps1.mit, "./phyobjects/ps1.mit.rds")
+saveRDS(ps1.faeces, "./phyobjects/ps1.faeces.rds")
+saveRDS(ps1.faeces.pre, "./phyobjects/ps1.faeces.pre.rds")
+saveRDS(ps1.faeces.post, "./phyobjects/ps1.faeces.post.rds")
+saveRDS(ps1.glucan, "./phyobjects/ps1.glucan.rds")
+saveRDS(ps1.digesta, "./phyobjects/ps1.digesta.rds")
+saveRDS(ps1.jejunum.digesta, "./phyobjects/ps1.jejunum.digesta.rds")
+saveRDS(ps1.ileum.digesta, "./phyobjects/ps1.ileum.digesta.rds") 
+saveRDS(ps1.caecum.digesta, "./phyobjects/ps1.caecum.digesta.rds")
+saveRDS(ps1.swabs, "./phyobjects/ps1.swabs.rds")
+saveRDS(ps1.no.swabs, "./phyobjects/ps1.no.swabs.rds")
+saveRDS(ps1.archaea, "./phyobjects/ps1.archaea.rds")
+
+# load full datasets from RDS
+ps1.all <- readRDS("./phyobjects/ps1.all.rds")
+```
+
+## 3.8. Exploring specs  
+Exploring the stats of the datasets: # reads, ASVs, nr of genera, etc. 
+```{r}
+sum(sample_sums(ps1.all)) # raw phyloseq
+sum(sample_sums(ps1)) # excl mitrochondria/chloroplast, incl contaminants
+sum(sample_sums(ps1.decontam)) # excl mitrochondria/chloroplast, excl contaminants
+
+print(ps1)
+ntaxa(aggregate_taxa(ps1,"Genus"))
+colnames(tax_table(ps1))
+```
+
+# 4. Alpha diversity analyses
+
+## 4.1. Loading data for plots
+```{r}
+ps1.faeces <- readRDS("./phyobjects/ps1.faeces.rds") #all faecal samples
+
+# this line is used to make sure the order of days is chronological:
+ps1.faeces@sam_data$Day_of_study_factor <- factor(ps1.faeces@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70")) 
+# this line is used to make sure pre-weaning is followed by post-weaning:
+ps1.faeces@sam_data$Pre_or_post_weaning <- factor(ps1.faeces@sam_data$Pre_or_post_weaning, levels = c("Pre-weaning", "Post-weaning")) 
+
+ps1.digesta <- readRDS("./phyobjects/ps1.digesta.rds") #all digesta samples
+# this line is used to reorder segments according order luminal content passages through the GI tract of the animals:
+ps1.digesta@sam_data$Origin <- factor(ps1.digesta@sam_data$Origin, levels = c("jejunum_digesta", "ileum_digesta", "caecum_digesta")) 
+print(ps1.digesta) #contains 1608 taxa in 134 samples
+
+ps1.glucan <- readRDS("./phyobjects/ps1.glucan.rds") #all faecal and digestal samples of the current study
+
+# this line is used to combine faeces and digesta in an orderly fashion for use in the alpha-diversity plots:
+ps1.glucan@sam_data$Origin_Day <- factor(ps1.glucan@sam_data$Origin_Day, levels = c("faeces_Day_4", "faeces_Day_8", "faeces_Day_14", "faeces_Day_26", "faeces_Day_35", "faeces_Day_43", "faeces_Day_59", "faeces_Day_69", "jejunum_digesta_Day_27", "jejunum_digesta_Day_44", "jejunum_digesta_Day_70", "ileum_digesta_Day_27", "ileum_digesta_Day_44", "ileum_digesta_Day_70", "caecum_digesta_Day_27", "caecum_digesta_Day_44", "caecum_digesta_Day_70")) 
+```
+
+## 4.2. Plotting
+```{r}
+p <- plot_richness(ps1.faeces, "Day_of_study_factor", color = "Treatment", measures = "Shannon")
+p <- p + geom_boxplot(outlier.shape = NA, aes(fill = "Day_of_study")) + scale_fill_manual(values = c("white", "#5F7FC7", "orange","#DA5724", "#508578"))
+p <- p + geom_point(position=position_jitterdodge(), alpha=1, size=1.5) #+ theme_bw()
+p$layers <- p$layers[-1]
+print (p) #this plot is created for illustrative purposes, and is not saved or used in the manuscript
+
+p <- plot_richness(ps1.digesta, "Day_of_study_factor", color = "Treatment", measures = "Shannon")
+p <- p + geom_boxplot(outlier.shape = NA, aes(fill = "Day_of_study")) + scale_fill_manual(values = c("white", "#5F7FC7", "orange","#DA5724", "#508578"))
+p <- p + geom_point(position=position_jitterdodge(), alpha=1, size=1.5)
+p <- p + facet_wrap("Origin")
+p$layers <- p$layers[-1]
+print (p) #this plot is created for illustrative purposes, and is not saved or used in the manuscript
+
+# following figures combine the faeces and digesta alpha diversities
+p <- plot_richness(ps1.glucan, "Origin_Day", color = "Treatment", measures = "Shannon")
+p <- p + geom_boxplot(outlier.shape = NA, aes(fill = "Origin_Day")) + scale_fill_manual(values = c("white", "#5F7FC7", "orange","#DA5724", "#508578"))
+p <- p + geom_point(position=position_jitterdodge(), alpha = .9, size=2)
+p$layers <- p$layers[-1]
+#The final figure can be found under panel B in Figure 2 of the manuscript
+print(p)
+ggsave("./figures/Alpha_diversity_Shannon.pdf", height = 7, width = 11)
+
+p <- plot_richness(ps1.glucan, "Origin_Day", color = "Treatment", measures = "InvSimpson")
+p <- p + geom_boxplot(outlier.shape = NA, aes(fill = "Origin_Day")) + scale_fill_manual(values = c("white", "#5F7FC7", "orange","#DA5724", "#508578"))
+p <- p + geom_point(position=position_jitterdodge(), alpha = .9, size=2)
+p$layers <- p$layers[-1]
+#The final figure can be found under panel A in Figure 2 of the manuscript
+print(p)
+ggsave("./figures/Alpha_diversity_InvSimpson.pdf", height = 7, width = 11)
+```
+
+## 4.3. Loading data for LME Models
+Loading data for LME (Linear Mixed-Effects models)
+```{r}
+ps1 <- readRDS("./phyobjects/ps1.glucan.rds")
+
+ps1@sam_data$Day_of_study_factor <- factor(ps1@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+ps1@sam_data$Pre_or_post_weaning <- factor(ps1@sam_data$Pre_or_post_weaning, levels = c("Pre_weaning", "Post_weaning"))
+
+#ps1 <- tax_glom(ps1, "Genus") One can aggregate ASVs to genus level to facilitate genus-level analysis. It was however chosen to work with ASV-level data for alpha diversity analyses so this line is not used.
+
+ps1.fcs <- subset_samples(ps1, Origin %in% c("faeces"))
+ps1.fcs.pre <- subset_samples(ps1.fcs, Pre_or_post_weaning %in% c("Pre_weaning"))
+ps1.jej <- subset_samples(ps1, Origin %in% c("jejunum_digesta"))
+ps1.ile <- subset_samples(ps1, Origin %in% c("ileum_digesta"))
+ps1.cae <- subset_samples(ps1, Origin %in% c("caecum_digesta"))
+
+ps1.fcs <- prune_taxa(taxa_sums(otu_table(ps1.fcs))>0, ps1.fcs)
+ps1.fcs.pre <- prune_taxa(taxa_sums(otu_table(ps1.fcs.pre))>0, ps1.fcs.pre)
+ps1.jej <- prune_taxa(taxa_sums(otu_table(ps1.jej))>0, ps1.jej)
+ps1.ile <- prune_taxa(taxa_sums(otu_table(ps1.ile))>0, ps1.ile)
+ps1.cae <- prune_taxa(taxa_sums(otu_table(ps1.cae))>0, ps1.cae)
+
+ps1.fcs.r <- microbiome::transform(ps1.fcs, "compositional")
+ps1.fcs.pre.r <- microbiome::transform(ps1.fcs.pre, "compositional")
+ps1.jej.r <- microbiome::transform(ps1.jej, "compositional")
+ps1.ile.r <- microbiome::transform(ps1.ile, "compositional")
+ps1.cae.r <- microbiome::transform(ps1.cae, "compositional")
+
+# input for alpha diversity
+ps1.otu <- as.data.frame(ps1.fcs.r@otu_table)
+ps1.tree <- ps1.fcs.r@phy_tree
+
+ps1.pre.otu <- as.data.frame(ps1.fcs.pre.r@otu_table)
+ps1.pre.tree <- ps1.fcs.pre.r@phy_tree
+
+ps1.jej.otu <- as.data.frame(ps1.jej.r@otu_table)
+ps1.jej.tree <- ps1.jej.r@phy_tree
+
+ps1.ile.otu <- as.data.frame(ps1.ile.r@otu_table)
+ps1.ile.tree <- ps1.ile.r@phy_tree
+
+ps1.cae.otu <- as.data.frame(ps1.cae.r@otu_table)
+ps1.cae.tree <- ps1.cae.r@phy_tree
+
+```
+
+
+## 4.4. Calculate alpha diversity  
+```{r}
+# calculate Shannon and InvSimpson alpha diversity and add metadata
+ad.df <- data.frame("Description" = colnames(ps1.otu))
+
+ad.df$Shannon <- estimate_richness(ps1.fcs)$Shannon
+ad.df$InvSimpson <- estimate_richness(ps1.fcs)$InvSimpson
+
+ad.df <- merge(meta(ps1.fcs.r), ad.df, by = "Description", all.x=T)
+
+ad.df <- ad.df
+
+```
+
+## 4.5. Analysis on all faecal samples
+```{r}
+# mixed model: random term and variance structure
+lme.pd1 <- lme(Shannon ~ Day_of_study_factor * Treatment,
+              data = ad.df, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+lme.pd2 <- lme(InvSimpson ~ Day_of_study_factor * Treatment,
+              data = ad.df, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+# residual plots to visually inspect normality assumption
+plot(resid(lme.pd1, method= "pearson")~ad.df$Day_of_study_factor); abline(0,0)
+hist(resid(lme.pd1, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.pd1, ∼ranef (.))
+qqnorm(lme.pd1)
+
+plot(resid(lme.pd2, method= "pearson")~ad.df$Day_of_study_factor); abline(0,0)
+hist(resid(lme.pd2, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.pd2, ∼ranef (.))
+qqnorm(lme.pd2)
+
+# model output
+aov.pd.ls1 <- anova(lme.pd1)
+aov.pd.ls1
+
+aov.pd.ls2 <- anova(lme.pd2)
+aov.pd.ls2
+
+# test differences between timepoints - Shannon diversity
+res.aov2 <- aov(Shannon ~ Day_of_study_factor, data = ad.df)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+
+# test differences between timepoints - InvSimpson diversity
+res.aov2 <- aov(InvSimpson ~ Day_of_study_factor, data = ad.df)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+```
+
+## 4.6. Alpha diversity - pre-weaning
+```{r}
+# calculate Shannon and InvSimpson alpha diversity and add metadata
+ad.df.pre <- data.frame("Description" = colnames(ps1.pre.otu))
+
+ad.df.pre$Shannon <- estimate_richness(ps1.fcs.pre)$Shannon
+ad.df.pre$InvSimpson <- estimate_richness(ps1.fcs.pre)$InvSimpson
+
+ad.df.pre <- merge(meta(ps1.fcs.pre.r), ad.df.pre, by = "Description", all.x=T)
+
+ad.df.pre <- ad.df.pre
+
+```
+
+## 4.7. LME pre-weaning faecal samples
+```{r}
+# mixed model: random term and variance structure
+lme.pre.pd1 <- lme(Shannon ~ Day_of_study_factor * Treatment,
+              data = ad.df.pre, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+lme.pre.pd2 <- lme(InvSimpson ~ Day_of_study_factor * Treatment,
+              data = ad.df.pre, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+
+# residual plots to visually inspect normality assumption
+plot(resid(lme.pre.pd1, method= "pearson")~ad.df.pre$Day_of_study_factor); abline(0,0)
+hist(resid(lme.pre.pd1, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.pre.pd1, ∼ranef (.))
+qqnorm(lme.pre.pd1)
+
+plot(resid(lme.pre.pd2, method= "pearson")~ad.df.pre$Day_of_study_factor); abline(0,0)
+hist(resid(lme.pre.pd2, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.pre.pd2, ∼ranef (.))
+qqnorm(lme.pre.pd2)
+
+# model output
+aov.pd.ls1 <- anova(lme.pre.pd1)
+aov.pd.ls1
+
+aov.pd.ls2 <- anova(lme.pre.pd2)
+aov.pd.ls2
+```
+
+## 4.8. Alpha diversity - jejunum digesta
+```{r}
+# calculate Shannon and InvSimpson alpha diversity and add metadata
+ad.df.jej <- data.frame("Description" = colnames(ps1.jej.otu)) 
+
+ad.df.jej$Shannon <- estimate_richness(ps1.jej)$Shannon
+ad.df.jej$InvSimpson <- estimate_richness(ps1.jej)$InvSimpson
+
+ad.df.jej <- merge(meta(ps1.jej.r), ad.df.jej, by = "Description", all.x=T)
+
+ad.df.jej <- ad.df.jej
+```
+
+## 4.9. LME jejunum luminal samples
+```{r}
+# mixed model: random term and variance structure
+lme.jej.pd1 <- lme(Shannon ~ Day_of_study_factor * Treatment,
+              data = ad.df.jej, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+lme.jej.pd2 <- lme(InvSimpson ~ Day_of_study_factor * Treatment,
+              data = ad.df.jej, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+# residual plots to visually inspect normality assumption
+plot(resid(lme.jej.pd1, method= "pearson")~ad.df.jej$Day_of_study_factor); abline(0,0)
+hist(resid(lme.jej.pd1, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.jej.pd1, ∼ranef (.))
+qqnorm(lme.jej.pd1)
+
+plot(resid(lme.jej.pd2, method= "pearson")~ad.df.jej$Day_of_study_factor); abline(0,0)
+hist(resid(lme.jej.pd2, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.jej.pd2, ∼ranef (.))
+qqnorm(lme.jej.pd2)
+
+# model output
+aov.pd.ls1 <- anova(lme.jej.pd1)
+aov.pd.ls1
+
+aov.pd.ls2 <- anova(lme.jej.pd2)
+aov.pd.ls2
+
+# test differences between timepoints - Shannon diversity
+res.aov2 <- aov(Shannon ~ Day_of_study_factor, data = ad.df.jej)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+
+# test differences between timepoints - InvSimpson diversity
+res.aov2 <- aov(InvSimpson ~ Day_of_study_factor, data = ad.df.jej)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+
+```
+
+## 4.10. Alpha diversity - ileum digesta
+```{r}
+# calculate Shannon and InvSimpson alpha diversity and add metadata
+ad.df.ile <- data.frame("Description" = colnames(ps1.ile.otu))
+
+ad.df.ile$Shannon <- estimate_richness(ps1.ile)$Shannon
+ad.df.ile$InvSimpson <- estimate_richness(ps1.ile)$InvSimpson
+
+ad.df.ile <- merge(meta(ps1.ile.r), ad.df.ile, by = "Description", all.x=T)
+
+ad.df.ile <- ad.df.ile
+
+```
+
+## 4.11. LME ileum luminal samples
+```{r}
+# mixed model: random term and variance structure
+lme.ile.pd1 <- lme(Shannon ~ Day_of_study_factor * Treatment,
+              data = ad.df.ile, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+lme.ile.pd2 <- lme(InvSimpson ~ Day_of_study_factor * Treatment,
+              data = ad.df.ile, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+# residual plots to visually inspect normality assumption
+plot(resid(lme.ile.pd1, method= "pearson")~ad.df.ile$Day_of_study_factor); abline(0,0)
+hist(resid(lme.ile.pd1, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.ile.pd1, ∼ranef (.))
+qqnorm(lme.ile.pd1)
+
+plot(resid(lme.ile.pd2, method= "pearson")~ad.df.ile$Day_of_study_factor); abline(0,0)
+hist(resid(lme.ile.pd2, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.ile.pd2, ∼ranef (.))
+qqnorm(lme.ile.pd2)
+
+# model output
+aov.pd.ls1 <- anova(lme.ile.pd1)
+aov.pd.ls1
+
+aov.pd.ls2 <- anova(lme.ile.pd2)
+aov.pd.ls2
+
+# test differences between timepoints - Shannon diversity
+res.aov2 <- aov(Shannon ~ Day_of_study_factor, data = ad.df.ile)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+
+# test differences between timepoints - InvSimpson diversity
+res.aov2 <- aov(InvSimpson ~ Day_of_study_factor, data = ad.df.ile)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+```
+
+
+## 4.12. Alpha diversity - caecum digesta
+```{r}
+# calculate Shannon and InvSimpson alpha diversity and add metadata
+ad.df.cae <- data.frame("Description" = colnames(ps1.cae.otu))
+
+ad.df.cae$Shannon <- estimate_richness(ps1.cae)$Shannon
+ad.df.cae$InvSimpson <- estimate_richness(ps1.cae)$InvSimpson
+
+ad.df.cae <- merge(meta(ps1.cae.r), ad.df.cae, by = "Description", all.x=T)
+
+ad.df.cae <- ad.df.cae
+```
+
+## 4.13. LME caecum luminal samples
+```{r}
+# mixed model: random term and variance structure
+lme.cae.pd1 <- lme(Shannon ~ Day_of_study_factor * Treatment,
+              data = ad.df.cae, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+lme.cae.pd2 <- lme(InvSimpson ~ Day_of_study_factor * Treatment,
+              data = ad.df.cae, method = "REML",
+              random = ~ 1 | Ear_tag)
+
+
+# residual plots to visually inspect normality assumption
+plot(resid(lme.cae.pd1, method= "pearson")~ad.df.cae$Day_of_study_factor); abline(0,0)
+hist(resid(lme.cae.pd1, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.cae.pd1, ∼ranef (.))
+qqnorm(lme.cae.pd1)
+
+plot(resid(lme.cae.pd2, method= "pearson")~ad.df.cae$Day_of_study_factor); abline(0,0)
+hist(resid(lme.cae.pd2, method= "pearson"), breaks=30, col="grey")
+qqnorm(lme.cae.pd2, ∼ranef (.))
+qqnorm(lme.cae.pd2)
+
+# model output
+aov.pd.ls1 <- anova(lme.cae.pd1)
+aov.pd.ls1
+
+aov.pd.ls2 <- anova(lme.cae.pd2)
+aov.pd.ls2
+
+# test differences between timepoints - Shannon diversity
+res.aov2 <- aov(Shannon ~ Day_of_study_factor, data = ad.df.cae)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+
+# test differences between timepoints - InvSimpson diversity
+res.aov2 <- aov(InvSimpson ~ Day_of_study_factor, data = ad.df.cae)
+summary(res.aov2)
+
+TukeyHSD(res.aov2, which = "Day_of_study_factor")
+```
+
+# 5. Community composition analyses
+
+## 5.1. Load data  
+```{r}
+ps1.glucan <- readRDS("./phyobjects/ps1.glucan.rds")
+print(ps1.glucan)
+
+ps1.glucan@sam_data$Day_of_study <- factor(ps1.glucan@sam_data$Day_of_study, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+ps1.glucan@sam_data$Pre_or_post_weaning <- factor(ps1.glucan@sam_data$Pre_or_post_weaning, levels = c("Pre-weaning", "Post-weaning"))
+ps1.glucan@sam_data$Origin_Day <- factor(ps1.glucan@sam_data$Origin_Day, levels = c("faeces_Day_4", "faeces_Day_8", "faeces_Day_14", "faeces_Day_26", "faeces_Day_35", "faeces_Day_43", "faeces_Day_59", "faeces_Day_69", "jejunum_digesta_Day_27", "jejunum_digesta_Day_44", "jejunum_digesta_Day_70", "ileum_digesta_Day_27", "ileum_digesta_Day_44", "ileum_digesta_Day_70", "caecum_digesta_Day_27", "caecum_digesta_Day_44", "caecum_digesta_Day_70"))
+```
+
+## 5.2. Prepare data  
+```{r}
+ps1.subset <- subset_samples(ps1.glucan, Origin %in% c("faeces", "jejunum_digesta", "ileum_digesta", "caecum_digesta"))
+ps1.subset <- prune_taxa(taxa_sums(otu_table(ps1.subset))>0, ps1.subset)
+
+taxic <- as.data.frame(ps1.subset@tax_table)
+taxic$OTU <- rownames(taxic)
+tax_table(ps1.subset) <- tax_table(as.matrix(taxic))
+ps1.subset@phy_tree <- NULL
+
+ps1.fam <- microbiome::aggregate_top_taxa(ps1.subset, "Family", top = 25)
+ps1.fam.r <- microbiome::transform(ps1.fam, "compositional")
+```
+
+## 5.3. Plot presets
+```{r}
+getPalette = colorRampPalette(brewer.pal(12, "Paired"))
+
+guide_italics <- guides(fill = guide_legend(label.theme = element_text(size = 15, 
+    face = "italic", colour = "Black", angle = 0)))
+```
+
+## 5.4. Barplots
+Barplot family level  
+```{r}
+pFam1 <- plot_composition(ps1.fam.r, x.label = "Treatment", 
+                          otu.sort = "abundance",
+                          group_by = "Origin_Day", average_by = "Origin_Day") +
+  scale_fill_manual(values = getPalette(26)) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.title = element_text(size=18),
+        legend.position = "right") + 
+  ggtitle("Relative abundance") + guide_italics
+pFam1 
+
+pdf(file = "./figures/Barplot_Family.pdf", height = 10, width = 15)
+pFam1
+dev.off() #The final figure can be found under panel B in Figure 3 of the manuscript
+```
+
+Barplot on Phylum level - prepare data
+```{r}
+ps1.subset <- subset_samples(ps1.glucan, Origin %in% c("faeces", "jejunum_digesta", "ileum_digesta", "caecum_digesta"))
+ps1.subset <- prune_taxa(taxa_sums(otu_table(ps1.subset))>0, ps1.subset)
+
+taxic <- as.data.frame(ps1.subset@tax_table)
+taxic$OTU <- rownames(taxic)
+tax_table(ps1.subset) <- tax_table(as.matrix(taxic))
+ps1.subset@phy_tree <- NULL
+
+ps1.phyl <- microbiome::aggregate_top_taxa(ps1.subset, "Phylum", top = 10)
+ps1.phyl.r <- microbiome::transform(ps1.phyl, "compositional")
+```
+
+Barplot Phylum level  
+```{r}
+pphyl1 <- plot_composition(ps1.phyl.r, sample.sort = "neatmap", x.label = "Treatment", otu.sort = "abundance", group_by = "Origin_Day", average_by = "Origin_Day") +
+  scale_fill_manual(values = getPalette(11)) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.title = element_text(size=18),
+        legend.position = "right") + 
+  ggtitle("Relative abundance") + guide_italics
+pphyl1 
+
+pdf(file = "./figures/Barplot_Phylum.pdf", height = 10, width = 12)
+pphyl1 
+dev.off() #The final figure can be found under panel A in Figure 3 of the manuscript
+```
+
+Barplot with Archaea - prepare data
+```{r}
+ps1.glucan.r <- microbiome::transform(ps1.glucan, "compositional")
+
+ps1.archaea <- subset_taxa(ps1.glucan.r, Phylum == "Euryarchaeota")
+ps1.archaea
+
+ps1.subset <- subset_samples(ps1.archaea, Origin %in% c("faeces", "jejunum_digesta", "ileum_digesta", "caecum_digesta"))
+ps1.subset <- prune_taxa(taxa_sums(otu_table(ps1.subset))>0, ps1.subset)
+
+taxic <- as.data.frame(ps1.subset@tax_table)
+taxic$OTU <- rownames(taxic)
+tax_table(ps1.subset) <- tax_table(as.matrix(taxic))
+ps1.subset@phy_tree <- NULL
+
+ps1.phyl <- microbiome::aggregate_top_taxa(ps1.subset, "Genus", top = 10)
+```
+
+Barplot with Archaea
+```{r}
+pphyl1 <- plot_composition(ps1.phyl, x.label = "Treatment", otu.sort = "abundance", group_by = "Origin_Day", average_by = "Origin_Day") +
+  scale_fill_manual(values = getPalette(5)) + theme_bw() +
+  theme(axis.text.x = element_text(angle = 90),
+        legend.title = element_text(size=18),
+        legend.position = "right") + 
+  ggtitle("Relative abundance") + guide_italics
+pphyl1 
+
+pdf(file = "./figures/Barplot_Genus_archaea.pdf", height = 10, width = 13)
+pphyl1
+dev.off() #The final figure can be found as Supplementary Figure S5 of the manuscript
+
+data <- pphyl1$data #data object generated to investigate abundances of Archaea
+```
+
+# 6. Beta-diversity analysis
+## 6.1. Input data PCoA plot
+Input data Principal Coordinates Analysis plot
+```{r}
+ps1 <- readRDS("./phyobjects/ps1.glucan.rds")
+
+ps1@sam_data$Day_of_study_factor <- factor(ps1@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+ps1@sam_data$Pre_or_post_weaning <- factor(ps1@sam_data$Pre_or_post_weaning, levels = c("Pre_weaning", "Post_weaning"))
+
+ps1 <- subset_samples(ps1, Origin %in% c("faeces")) 
+ps1 <- prune_taxa(taxa_sums(ps1) > 0, ps1)
+ps1 <- microbiome::transform(ps1, "compositional")
+```
+
+## 6.2. Principal Coordinates Analysis plot
+Ordination plot based on Weighted Unifrac
+```{r}
+set.seed(49275)
+ordu.wt.uni = ordinate(ps1, "PCoA", "unifrac", weighted=TRUE)
+
+wt.unifrac <- plot_ordination(ps1, ordu.wt.uni, color="Day_of_study_factor", shape="Treatment")
+wt.unifrac <- wt.unifrac + scale_color_viridis(discrete = TRUE, option = "C")+ scale_fill_viridis(discrete = TRUE) +
+ggtitle("Ordination plot - PCoA, Weighted UniFrac faecal samples") + geom_point(size = 3) + scale_shape_manual(values=c(15,17))
+wt.unifrac <- wt.unifrac + 
+  stat_ellipse(type = "norm", linetype = 5) +
+  theme_bw()
+print(wt.unifrac)
+
+pdf(file = "./figures/PCoA_wt.unifrac.pdf", height = 10, width = 15)
+wt.unifrac
+dev.off() #The final figure can be found as Figure 4 of the manuscript
+```
+
+## 6.3. Load beta-diversity data
+```{r}
+ps1 <- readRDS("./phyobjects/ps1.glucan.rds")
+
+ps1@sam_data$Day_of_study_factor <- factor(ps1@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+ps1@sam_data$Pre_or_post_weaning <- factor(ps1@sam_data$Pre_or_post_weaning, levels = c("Pre_weaning", "Post_weaning"))
+
+# subsetting
+ps1.fcs <- subset_samples(ps1, Origin %in% c("faeces"))
+ps1.fcs.pre <- subset_samples(ps1.fcs, Pre_or_post_weaning %in% c("Pre_weaning"))
+
+ps1.fcs.r <- microbiome::transform(ps1.fcs, "compositional")
+ps1.fcs.pre.r <- microbiome::transform(ps1.fcs.pre, "compositional")
+
+# Conversions of data for Adonis tests
+fcs.otu <- abundances(ps1.fcs.r)
+fcs.meta <- meta(ps1.fcs.r)
+
+fcs.otu.pre <- abundances(ps1.fcs.pre.r)
+fcs.meta.pre <- meta(ps1.fcs.pre.r)
+```
+
+## 6.4. Visualize microbiome variation
+Visualize the population density and highlight sample groups:
+```{r}
+p <- plot_landscape(ps1.fcs.r, method = "NMDS", distance = "bray", col = "Day_of_study_factor", size =3)
+print(p)
+
+p <- plot_landscape(ps1.fcs.r, method = "NMDS", distance = "bray", col = "Treatment", size =3)
+print(p)
+
+p <- plot_landscape(ps1.fcs.pre.r, method = "NMDS", distance = "bray", col = "Day_of_study_factor", size =3)
+print(p)
+
+p <- plot_landscape(ps1.fcs.pre.r, method = "NMDS", distance = "bray", col = "Treatment", size =3)
+print(p)
+```
+
+## 6.5. PERMANOVA significance test 
+PERMANOVA significance test for group-level differences
+```{r}
+set.seed(343)
+permanova <- adonis(t(fcs.otu) ~ Treatment + Day_of_study_factor,
+                    data = fcs.meta, permutations=9999, method = "bray")
+
+print(as.data.frame(permanova$aov.tab)) #no differences in beta-diversity between treatment groups
+
+set.seed(456)
+permanova.pre <- adonis(t(fcs.otu.pre) ~ Treatment + Day_of_study_factor,
+                    data = fcs.meta.pre, permutations=9999, method = "bray")
+
+print(as.data.frame(permanova.pre$aov.tab)) #differences in beta-diversity between treatment groups
+```
+
+## 6.6. Checking homogeneity assumption
+```{r}
+# all faecal samples - dispersion between treatment groups
+dist <- vegdist(t(fcs.otu), method="bray")
+
+anova(betadisper(dist, fcs.meta$Treatment)) #no statistical significant differences in dispersion between treatment groups
+
+dispersion <- betadisper(dist, group= fcs.meta$Treatment)
+
+plot(dispersion, hull=FALSE, ellipse = TRUE)
+
+# dispersion pre- vs post-weaning
+anova(betadisper(dist, fcs.meta$Pre_or_post_weaning)) #statistical significant differences in dispersion between pre- and post-weaning samples
+
+dispersion_weaning <- betadisper(dist, group= fcs.meta$Pre_or_post_weaning) 
+
+plot(dispersion_weaning, hull=FALSE, ellipse = TRUE)
+
+# dispersion in each time-point
+anova(betadisper(dist, fcs.meta$Day_of_study_factor)) #statistical significant differences in dispersion between time points
+
+dispersion_day <- betadisper(dist, group = fcs.meta$Day_of_study_factor)
+
+plot(dispersion_day, hull=FALSE, ellipse = TRUE)
+
+# pre-weaning faecal samples - dispersion between treatment groups
+dist.pre <- vegdist(t(fcs.otu.pre), method="bray")
+
+anova(betadisper(dist.pre, fcs.meta.pre$Treatment)) #no statistical significant differences in dispersion between groups in pre-weaning faecal samples
+
+dispersion.pre <- betadisper(dist.pre, group= fcs.meta.pre$Treatment)
+
+plot(dispersion.pre, hull=FALSE, ellipse = TRUE)
+
+# pre-weaning faecal samples - dispersion in each time-point
+anova(betadisper(dist.pre, fcs.meta.pre$Day_of_study_factor)) #no statistical significant differences in dispersion between timepoints in pre-weaning faecal samples
+
+dispersion.pre_day <- betadisper(dist.pre, group = fcs.meta.pre$Day_of_study_factor)
+
+plot(dispersion.pre_day, hull=FALSE, ellipse = TRUE)
+```
+
+# 7. Abundance testing 
+
+## 7.1. Load data  
+```{r}
+ps1.glucan <- readRDS("./phyobjects/ps1.glucan.rds")
+
+ps1.glucan@sam_data$Day_of_study_factor <- factor(ps1.glucan@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+
+ps1.glucan.g <- tax_glom(ps1.glucan, "Genus")
+ps1.glucan.g.r <- microbiome::transform(ps1.glucan.g, "compositional")
+
+ps1.glucan.g.r <- subset_samples(ps1.glucan.g.r, Origin %in% c("faeces"))
+ps1.glucan.g.r <- subset_samples(ps1.glucan.g.r, Pre_or_post_weaning %in% c("Pre_weaning"))
+
+ps1.glucan.g.r <- filter_taxa(ps1.glucan.g.r, function(x) sum(x > 0.001) > (0.50*length(x)), TRUE)
+ps1.glucan.p <- prune_taxa(taxa_sums(otu_table(ps1.glucan.g.r)) > 0, ps1.glucan.g.r)
+
+# tax table with OTU column and best_hit
+glucan.tax <- as.data.frame(tax_table(ps1.glucan.g.r))
+glucan.tax$OTU <- rownames(glucan.tax)
+tax_table(ps1.glucan.g.r) <- tax_table(as.matrix(glucan.tax))
+ps1.glucan.g.bh <- format_to_besthit(ps1.glucan.g.r)
+glucan.tax.bh <- as.data.frame(tax_table(ps1.glucan.g.bh))
+colnames(glucan.tax.bh)[7] <- "OTU"
+```
+
+## 7.2. Prepare data
+```{r}
+glucan.g.met <- meta(ps1.glucan.p)
+
+glucan.g1 <- glucan.g.met[,c("Description","Ear_tag", "department_pre_weaning",
+               "Treatment","Day_of_study_factor")]
+# OTU table as dataframe:
+glucan.g2 <- as.data.frame(t(otu_table(ps1.glucan.p)))
+glucan.g2$Description <- rownames(glucan.g2)
+# merge files
+glucan.g3 <- merge(glucan.g1, glucan.g2, by = "Description")
+colnames(glucan.g3)[6:36] <- paste("k__", sep = "", colnames(glucan.g3)[6:36])
+```
+
+## 7.3. Abundance testing
+Abundance testing on pre-weaning faecal samples
+```{r, results= 'hide', warning=FALSE, message=FALSE}
+# Results, warnings and messages have been inactivated for this markdown, as otherwise it will use too much space in the HTML output file.
+tc.treatment <- taxa.compare(taxtab = glucan.g3, propmed.rel = "gamlss",
+                        transform = "none", comvar = "Treatment",
+                        adjustvar = c("Day_of_study_factor", "department_pre_weaning"),
+                        personid = "Ear_tag", longitudinal = "yes",
+                        p.adjust.method = "fdr")
+
+tc.glucan05 <- subset(tc.treatment, pval.adjust.TreatmentY_glucan < .05)
+
+tc.glucan05$id <- droplevels(as.factor(tc.glucan05$id))
+
+glucan3.m <- reshape2::melt(glucan.g3)
+glucan3.max <- ddply(glucan3.m, .(variable), summarise, max = max(value))
+glucan3.max1 <- glucan3.max
+glucan3.max1$variable <- droplevels(glucan3.max1$variable)
+ 
+# subset
+glucan.g4 <- subset(glucan3.m, variable %in% tc.glucan05$id &
+                variable %in% glucan3.max1$variable)
+
+# create vector of genus names (OTU codes) to include in plots
+select.gen.glucan <- levels(droplevels(glucan.g4$variable)) # 27 genera
+select.gen.glucan <- sub("k__", "", select.gen.glucan) # remove "k__"
+select.gen.glucan
+```
+
+## 7.4. Editing output  
+```{r}
+tc.glucan.sub <- subset(tc.glucan05, id %in% glucan3.max1$variable)
+
+# remove "k__" in id names
+tc.glucan.sub$id <- as.factor(sub("k__", "", tc.glucan.sub$id))
+
+# show tax names of output genera
+glucan.g4.tax <- subset(glucan.tax.bh, OTU %in% select.gen.glucan) #significant genera
+
+# create vectors of significant genera from comparisons
+select.gen.glucan2 <- unique(c(as.character(select.gen.glucan)))
+```
+
+## 7.5. Prepare data for plotting
+```{r}
+# filter for genera from first output series of GAMLSS tests (select.gen.glucan2).
+
+# object 1: metadata
+glucan.tr.met <- meta(ps1.glucan.g.r)
+
+glucan.tr1 <- glucan.tr.met[,c("Description","Ear_tag", "department_pre_weaning",
+               "Treatment","Day_of_study_factor")]
+
+# object 2: OTU table
+glucan.tr2 <- as.data.frame(t(otu_table(ps1.glucan.g.r)))
+glucan.tr2$Description <- rownames(glucan.tr2)
+# melt glucan.tr2
+glucan.tr2.m <- reshape2::melt(glucan.tr2)
+colnames(glucan.tr2.m) <- c("Description", "OTU", "abund")
+# merge glucan.tr2, glucan.tax and glucan.tr1
+glucan.tr3a <- base::merge(glucan.tr2.m, glucan.tax, by = "OTU")
+glucan.tr3 <- base::merge(glucan.tr1, glucan.tr3a, by = "Description")
+
+# subset to signif genera and max(abund) > 0.1
+glucan.tr3.max <- ddply(glucan.tr3, .(OTU), summarise, max = max(abund))
+glucan.tr3.max <- subset(glucan.tr3.max, max > .1)
+glucan.tr3.max$OTU <- droplevels(glucan.tr3.max$OTU)
+glucan.tr3.s <- subset(glucan.tr3, OTU %in% select.gen.glucan2 & OTU %in%
+                     glucan.tr3.max$OTU)
+glucan.tr3.s$OTU <- droplevels(glucan.tr3.s$OTU)
+```
+
+## 7.6. Plot presets  
+```{r}
+theme4 <- theme_classic() + 
+  theme(panel.grid.major = element_line(colour = "grey80"),
+        panel.spacing = unit(.5,"lines"),
+        panel.border = element_rect(color = "black", fill = NA, size = .5),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        text = element_text(size=15),
+        axis.text.x = element_text(hjust = .5, vjust = .5),
+        plot.title = element_text(size = 12))
+labs_abd <- as_labeller(c(
+  "faeces" = "Faeces", "ileum_digesta" = "Ileum digesta", "jejunum_digesta" = " Jejunum digesta"))
+```
+
+## 7.7. Plotting loop
+```{r}
+# for-loop
+sig.plot <- list()
+for(i in 1:nlevels(glucan.tr3.s$OTU)){
+  a = levels(glucan.tr3.s$OTU)[i]
+  B = glucan.tr3.s[glucan.tr3.s$OTU == a,]
+  p = ggplot(B, aes(x = Day_of_study_factor, y = abund, colour = Treatment, alpha = 0.95)) +
+    geom_boxplot(outlier.size = 0) +
+    geom_point(size = 2, position = position_jitterdodge()) +
+    labs(x="time (d)", y="rel. abundance") +
+    scale_y_continuous(limits = c(0,1), n.breaks = 6) +
+    ggtitle(paste(B$Order,B$Family,B$Genus,B$OTU)) + theme4
+  sig.plot[[i]] = p
+}
+
+# print plots
+pdf("./figures/Differential_abundant_genera.pdf")
+for (i in 1:nlevels(glucan.tr3.s$OTU)) {
+    print(sig.plot[[i]])
+}
+dev.off() #Resulting figures can be found under Figure 5 of the manuscript
+```
+
+# 8. Distance-based PRC
+
+## 8.1. Load data and subset
+```{r}
+# only faeces pre-weaning
+fcs.pre <- readRDS("./phyobjects/ps1.faeces.rds")
+fcs.pre <- subset_samples(fcs.pre, Pre_or_post_weaning == "Pre_weaning")
+fcs.pre <- prune_taxa(taxa_sums(otu_table(fcs.pre)) > 0, fcs.pre)
+
+# only faeces post-weaning
+fcs.post <- readRDS("./phyobjects/ps1.faeces.rds")
+fcs.post <- subset_samples(fcs.post, Pre_or_post_weaning == "Post_weaning")
+fcs.post <- prune_taxa(taxa_sums(otu_table(fcs.post)) > 0, fcs.post)
+
+print(fcs.pre)
+print(fcs.post)
+
+# transform to relative abundance
+fcs.pre.r <- microbiome::transform(fcs.pre, "compositional")
+fcs.post.r <- microbiome::transform(fcs.post, "compositional")
+```
+
+## 8.2. PRC genus level - pre-weaning
+```{r}
+rank_names(fcs.pre.r)
+
+pre.gen.r <- tax_glom(fcs.pre.r, taxrank = rank_names(fcs.pre.r) [6]) #Aggregate to genus level
+
+# Add Family level names
+taxa_names(pre.gen.r) <- interaction(rownames(pre.gen.r@tax_table[,c("Family")]),pre.gen.r@tax_table[,c("Family")])
+# Add Genus level names
+taxa_names(pre.gen.r) <- interaction(rownames(pre.gen.r@tax_table[,c("Genus")]),pre.gen.r@tax_table[,c("Genus")])
+
+# Genus level
+df.pre.gen.r <- as.data.frame(t(abundances(pre.gen.r)))
+df.pre.gen.r$Description <- rownames(df.pre.gen.r)
+dfm.pre.gen.r <- merge(meta(pre.gen.r)[c("Description","Treatment", "Day_of_study")], df.pre.gen.r, by="Description")
+
+response<-dfm.pre.gen.r[,4:length(dfm.pre.gen.r)]
+time<-as.factor(dfm.pre.gen.r[,3])
+treatment<-as.factor(dfm.pre.gen.r[,2])
+
+# Set up objects and matrices
+y <- deparse(substitute(response))
+x <- deparse(substitute(treatment))
+z <- deparse(substitute(time))
+
+# Create formulas and design matrices
+fla <- as.formula(paste("~", x, "+", z))
+mf <- model.frame(fla, response, na.action = na.pass)
+fla.zx <- as.formula(paste("~", z, ":", x))
+fla.z <- as.formula(paste("~", z))
+X = model.matrix(fla.zx, mf)[, -c(seq_len(nlevels(time) + 1))]
+Z = model.matrix(fla.z, mf)[, -1]
+
+# Calculate Weighted UniFrac distance matrix
+dm.pre.gen.r.wUF <- UniFrac(pre.gen.r, weighted = T)
+
+# Calculation of UniFrac distance-based RDA
+dbRDA.pre <- capscale(dm.pre.gen.r.wUF ~ X + Condition(Z), data = dfm.pre.gen.r[,2:3], comm = response)
+
+# Conversion of dbRDA to PRC compatible format
+dbRDA.pre$terminfo$xlev = list(levels(time), levels(treatment))
+names(dbRDA.pre$terminfo$xlev) = c(paste(z), paste(x))
+dbRDA.pre$call <- match.call()
+class(dbRDA.pre) <- c("prc", class(dbRDA.pre))
+
+sum_dbprc <- summary(dbRDA.pre)
+plot(dbRDA.pre, main = "dbPRC faecal samples w_unifrac genus level", select = abs(sum_dbprc$sp) > 0.2)
+
+pdf(file = "./figures/prc_pre-weaning.pdf", height = 5, width = 8)
+plot(dbRDA.pre, main = "dbPRC faecal samples w_unifrac genus level", select = abs(sum_dbprc$sp) > 0.2)
+dev.off() #The final figure can be found under panel A in Supplementary Figure S4 of the manuscript
+```
+
+## 8.3. PRC genus level - post-weaning
+```{r}
+post.gen.r <- tax_glom(fcs.post.r, taxrank = rank_names(fcs.post.r) [6])
+
+rank_names(post.gen.r)
+
+# Add Family level names
+taxa_names(post.gen.r) <- interaction(rownames(post.gen.r@tax_table[,c("Family")]),post.gen.r@tax_table[,c("Family")])
+# Add Genus level names
+taxa_names(post.gen.r) <- interaction(rownames(post.gen.r@tax_table[,c("Genus")]),post.gen.r@tax_table[,c("Genus")])
+
+df.post.gen.r <- as.data.frame(t(abundances(post.gen.r)))
+df.post.gen.r$Description <- rownames(df.post.gen.r)
+dfm.post.gen.r <- merge(meta(post.gen.r)[c("Description","Treatment", "Day_of_study")], df.post.gen.r, by="Description")
+
+response<-dfm.post.gen.r[,4:length(dfm.post.gen.r)]
+time<-as.factor(dfm.post.gen.r[,3])
+treatment<-as.factor(dfm.post.gen.r[,2])
+
+# Set up objects and matrices
+y <- deparse(substitute(response))
+x <- deparse(substitute(treatment))
+z <- deparse(substitute(time))
+
+# Create formulas and design matrices
+fla <- as.formula(paste("~", x, "+", z))
+mf <- model.frame(fla, response, na.action = na.pass)
+fla.zx <- as.formula(paste("~", z, ":", x))
+fla.z <- as.formula(paste("~", z))
+X = model.matrix(fla.zx, mf)[, -c(seq_len(nlevels(time) + 1))]
+Z = model.matrix(fla.z, mf)[, -1]
+
+# Calculate Weighted UniFrac distance matrix
+dm.post.gen.r.wUF <- UniFrac(post.gen.r, weighted = T)
+
+# Calculation of UniFrac distance based RDA
+dbRDA.CFgen <- capscale(dm.post.gen.r.wUF ~ X + Condition(Z), data = dfm.post.gen.r[,2:3], comm = response)
+
+# Conversion of dbRDA to PRC compatible format
+dbRDA.CFgen$terminfo$xlev = list(levels(time), levels(treatment))
+names(dbRDA.CFgen$terminfo$xlev) = c(paste(z), paste(x))
+dbRDA.CFgen$call <- match.call()
+class(dbRDA.CFgen) <- c("prc", class(dbRDA.CFgen))
+
+sum_dbprc <- summary(dbRDA.CFgen)
+plot(dbRDA.CFgen, main = "dbPRC faecal samples w_unifrac genus level", select = abs(sum_dbprc$sp) > 0.2) 
+
+pdf(file = "./figures/prc_post-weaning.pdf", height = 5, width = 8)
+plot(dbRDA.CFgen, main = "dbPRC faecal samples w_unifrac genus level", select = abs(sum_dbprc$sp) > 0.2)
+dev.off() #The final figure can be found under panel B in Supplementary Figure S4 of the manuscript
+```
+
+# 9. Heatmap
+## 9.1. Input data - top 35 families
+```{r}
+ps1 <- readRDS("./phyobjects/ps1.glucan.rds")
+
+ps1@sam_data$Day_of_study_factor <- factor(ps1@sam_data$Day_of_study_factor, levels = c("Day_4", "Day_8", "Day_14", "Day_26", "Day_27", "Day_35", "Day_43", "Day_44", "Day_59", "Day_69", "Day_70"))
+ps1@sam_data$Pre_or_post_weaning <- factor(ps1@sam_data$Pre_or_post_weaning, levels = c("Pre_weaning", "Post_weaning"))
+
+ps1.fcs <- subset_samples(ps1, Origin %in% c("faeces"))
+ps1.fcs.fam <- microbiome::aggregate_taxa(ps1.fcs, "Family")
+# remove taxa with 0 abundance
+ps1.fcs.fam <- prune_taxa(taxa_sums(otu_table(ps1.fcs.fam)) > 0, ps1.fcs.fam)
+# add FAM column
+ps1.fcs.fam.tax <- as.data.frame(ps1.fcs.fam@tax_table)
+ps1.fcs.fam.tax$FAM <- rownames(ps1.fcs.fam.tax)
+tax_table(ps1.fcs.fam) <- tax_table(as.matrix(ps1.fcs.fam.tax))
+# relative abundance
+ps1.fcs.fam.r <- microbiome::transform(ps1.fcs.fam, "compositional")
+
+# select top 35 by summed rel. abund.
+ps1.fcs.fam.abund <- abundances(ps1.fcs.fam.r)
+ps1.fcs.fam.abund.m <- reshape2::melt(ps1.fcs.fam.abund)
+colnames(ps1.fcs.fam.abund.m) <- c("FAM", "Description", "rel_abund")
+ps1.fcs.fam.sum <- ddply(ps1.fcs.fam.abund.m, .(FAM), summarise, mean = mean(rel_abund))
+
+ps1.fcs.fam.tax$reads <- taxa_sums(ps1.fcs.fam) # total reads per genus
+ps1.fcs.fam.tax$sum_abund <- taxa_sums(ps1.fcs.fam.r) # summed relative abund.
+ps1.fcs.fam.tax$mean_abund <- ps1.fcs.fam.sum$mean # mean relative abundance
+
+# top 35
+ps1.fcs.fam.top35 <- top_n(ps1.fcs.fam.tax, n = 35, wt = sum_abund)
+ps1.fcs.fam.top35$FAM <- as.factor(ps1.fcs.fam.top35$FAM)
+
+# top 35 with phy_tree
+ps1.fcs.fam35.r <- subset_taxa(ps1.fcs.fam.r, FAM %in% ps1.fcs.fam.top35$FAM)
+```
+
+## 9.2. Plot presets
+```{r}
+theme_hm <- theme_classic() + theme(
+  axis.text.y = element_text(colour = 'black', face = 'italic'),
+  legend.key = element_blank(), text = element_text(size = 20),
+  panel.spacing.x=unit(0, "lines"),
+  strip.background = element_rect(colour="black", fill="white"))
+```
+
+## 9.3. Create heatmap plot data
+```{r}
+# create heatmap plot data
+fam35.hm.df <- plot_heatmap(ps1.fcs.fam35.r, method = "CAP", distance = "bray",
+                     formula = ~ Day_of_study_factor)$data
+
+# clean up tax names
+fam35.hm.df$taxname <- ifelse(fam35.hm.df$Family == "f__", 
+              yes = paste(fam35.hm.df$Class, "(unassigned)"),
+              no = paste(fam35.hm.df$Family))
+fam35.hm.df$taxname <- gsub(fam35.hm.df$taxname, pattern = "[a-z]__",
+                          replacement = "")
+
+# summarise per pen per timepoint
+fam35.hm.sum <- ddply(fam35.hm.df, .(Day_of_study_factor, Origin, Pen_no_pre_weaning,
+                               taxname, FAM),
+                   summarise, median = median(Abundance),
+                   mean = mean(Abundance))
+fam35.hm.sum$group <- interaction(fam35.hm.sum$Origin, 
+                               fam35.hm.sum$Day_of_study_factor, fam35.hm.sum$Pen_no_pre_weaning,
+                               drop=T)
+fam35.hm.sum$taxname <- as.factor(fam35.hm.sum$taxname)
+
+# Bray-curtis distance matrix for taxa clustering
+fam35.hm.cast <- reshape2::dcast(fam35.hm.sum[,c(4,6,8)], taxname ~ group,
+                              value.var = "median")
+rownames(fam35.hm.cast) <- fam35.hm.cast[,1]
+fam35.hm.mat <- as.matrix(fam35.hm.cast[,c(2:129)])
+bray35.sp <- vegdist(fam35.hm.mat, method = "bray")
+
+# reorder levels by clustering
+sp.order <- hclust(bray35.sp)$order
+fam35.hm.sum$taxname <- factor(fam35.hm.sum$taxname,
+                            levels(fam35.hm.sum$taxname)[sp.order])
+levels(fam35.hm.sum$taxname)
+```
+
+## 9.4. Plot heatmap
+With Bray-Curtis complete-linkage clustering of taxa.
+```{r}
+theme_hm <- theme_classic() + theme(
+  axis.text.y = element_text(colour = 'black', face = 'italic'),
+  axis.text.x = element_text(size = 10, colour = 'white', face = 'italic'),
+  legend.key = element_blank(), text = element_text(size = 20),
+  panel.spacing.x=unit(0, "lines"),
+  strip.background = element_rect(colour="black", fill="white"))
+
+p.fam35.hm <- ggplot(fam35.hm.sum, aes(x=Pen_no_pre_weaning, y=taxname)) +
+  geom_tile(aes(fill=mean)) + 
+  scale_fill_viridis("Rel. abundance", option = "E",
+                     na.value = "black", trans="log10") +
+  facet_grid(~Day_of_study_factor, scales = "free") +
+  labs(x="Means per pen",y=NULL) +
+  scale_y_discrete(position = "right") +
+  theme_hm
+p.fam35.hm
+
+pdf(file = "./figures/Heatmap_families.pdf", height = 9, width = 35)
+p.fam35.hm
+dev.off() #The final figure can be found as Supplementary Figure S6 of the manuscript
+```
+
+# 10. Immunological analyses 
+
+Figures were generated using code below, and were then manually exported. This is why they are not showing up in the 'figures' folder. The unprocessed figures can be found under their individual folders.
+
+## 10.1. Flow cytometry - t-test
+```{r}
+# Rotate input file from folder 'input_data_flow_cytometry' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_flow_cytometry/Flow_cytometry_DC_MLN_CDC1_CD8086_BG.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Load the data
+data("genderweight", package = "datarium")
+
+# Show a sample of the data by group
+set.seed(123)
+my_data %>% sample_n_by(group, size = 2)
+
+my_data %>%
+  group_by(group) %>%
+  get_summary_stats(score, type = "mean_sd")
+
+# Save the data in two different vector
+Y_glucan <- my_data %>%
+  filter(group == "Y_glucan") %>%
+  pull(score)
+Control <- my_data %>%
+  filter(group == "Control") %>%
+  pull(score)
+
+# Compute t-test
+res <- t.test(Y_glucan, Control)
+res
+
+# Levene
+levene_test(score ~ group, data = my_data)
+
+# Compute t-test
+res <- t.test(score ~ group, data = my_data)
+res
+
+stat.test <- my_data %>% 
+  t_test(score ~ group) %>%
+  add_significance()
+stat.test
+
+my_data %>%
+  t_test(score ~ group, detailed = TRUE) %>%
+  add_significance()
+
+my_data %>% cohens_d(score ~ group, var.equal = FALSE)
+
+# Create a box-plot
+bxp <- ggboxplot(
+  my_data, x = "group", y = "score", 
+  ylab = "score", xlab = "Groups", add = "jitter"
+)
+
+# Add p-value and significance levels
+stat.test <- stat.test %>% add_xy_position(x = "group")
+bxp + 
+  stat_pvalue_manual(stat.test, tip.length = 0) +
+  labs(subtitle = get_test_label(stat.test, detailed = TRUE))
+```
+
+## 10.2. Flow cytometry - two-way ANOVA
+```{r}
+# Rotate input file from folder 'input_data_flow_cytometry' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_flow_cytometry/Flow_cytometry_DC_MLN_CDC1_CD8086_BG.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Inspect some random rows of the data by groups
+set.seed(123)
+my_data %>% sample_n_by(group, time, size = 1)
+
+#Extreme outliers are removed from the analysis. 
+
+my_data %>%
+  group_by(time) %>%
+  identify_outliers(score)
+
+#Jitter
+
+my_data$group <- factor(my_data$group, levels = c("Control", "Y_glucan", "Control_med", "Y_glucan_med"))
+
+my_data %>%
+  filter(group %in% c("Control", "Y_glucan", "Control_med", "Y_glucan_med" )) %>%
+  ggplot(aes(x=time, y=score, fill = factor(group))) +
+  geom_boxplot() + 
+  labs(fill="group") +
+  scale_fill_manual(values = c("#E69F00", "#669966", "#CCCCCC", "#999999")) +
+  geom_point(position=position_jitterdodge(),alpha=0.5, size = 5)
+
+# Two-way ANOVA
+# http://rstudio-pubs-static.s3.amazonaws.com/476761_eb23c47a75d6447688cb793ac8a3e461.html
+
+res.aov2 <- aov(score ~ group + time, data = my_data)
+summary(res.aov2)
+
+# Two-way ANOVA with interaction effect
+# These two calls are equivalent
+res.aov3 <- aov(score ~ group * time, data = my_data)
+res.aov3 <- aov(score ~ group + time + group:time, data = my_data)
+summary(res.aov3)
+
+require("dplyr")
+group_by(my_data, group, time) %>%
+  summarise(
+    count = n(),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE)
+  )
+
+model.tables(res.aov2, type="means", se = TRUE)
+
+TukeyHSD(res.aov2, which = "time")
+
+# 1. Homogeneity of variances
+plot(res.aov3, 1)
+
+library(car)
+leveneTest(score ~ group*time, data = my_data)
+
+# 2. Normality
+plot(res.aov3, 2)
+
+# 3. Skewness
+
+#Skewness between -2 and +2 acceptable (George and Malley, 2010). 
+library(moments)
+skewness(my_data$score, na.rm = TRUE)
+
+# Extract the residuals
+aov_residuals <- residuals(object = res.aov3)
+# Run Shapiro-Wilk test
+shapiro.test(x = aov_residuals)
+```
+
+## 10.3. Restimulation assay - t-test
+```{r}
+# Rotate input file from folder 'input_data_restimulation_assay' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_restimulation_assay/Restimulation_Assay_MLN_IL10_CONA5.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Load the data
+data("genderweight", package = "datarium")
+
+# Show a sample of the data by group
+set.seed(123)
+my_data %>% sample_n_by(group, size = 2)
+
+my_data %>%
+  group_by(group) %>%
+  get_summary_stats(score, type = "mean_sd")
+
+# Save the data in two different vector
+Y_glucan <- my_data %>%
+  filter(group == "Y_glucan") %>%
+  pull(score)
+Control <- my_data %>%
+  filter(group == "Control") %>%
+  pull(score)
+
+# Compute t-test
+res <- t.test(Y_glucan, Control)
+res
+
+# Levene
+levene_test(score ~ group, data = my_data)
+
+# Compute t-test
+res <- t.test(score ~ group, data = my_data)
+res
+
+stat.test <- my_data %>% 
+  t_test(score ~ group) %>%
+  add_significance()
+stat.test
+
+my_data %>%
+  t_test(score ~ group, detailed = TRUE) %>%
+  add_significance()
+
+my_data %>% cohens_d(score ~ group, var.equal = FALSE)
+
+# Create a box-plot
+bxp <- ggboxplot(
+  my_data, x = "group", y = "score", 
+  ylab = "score", xlab = "Groups", add = "jitter"
+)
+
+# Add p-value and significance levels
+stat.test <- stat.test %>% add_xy_position(x = "group")
+bxp + 
+  stat_pvalue_manual(stat.test, tip.length = 0) +
+  labs(subtitle = get_test_label(stat.test, detailed = TRUE))
+```
+
+## 10.4. Rest. assay - two-way ANOVA
+Restimulation assay - two-way ANOVA
+```{r}
+# Rotate input file from folder 'input_data_restimulation_assay' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_restimulation_assay/Restimulation_Assay_MLN_IL10_CONA5.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Inspect some random rows of the data by groups
+set.seed(123)
+my_data %>% sample_n_by(group, time, size = 1)
+
+#Extreme outliers are removed from the analysis. 
+
+my_data %>%
+  group_by(time) %>%
+  identify_outliers(score)
+
+#Jitter
+
+my_data$group <- factor(my_data$group, levels = c("Control", "Y_glucan", "Control_med", "Y_glucan_med"))
+
+my_data %>%
+  filter(group %in% c("Control", "Y_glucan", "Control_med", "Y_glucan_med" )) %>%
+  ggplot(aes(x=time, y=score, fill = factor(group))) +
+  geom_boxplot() + 
+  labs(fill="group") +
+  scale_fill_manual(values = c("#E69F00", "#669966", "#CCCCCC", "#999999")) +
+  geom_point(position=position_jitterdodge(),alpha=0.5, size = 5)
+
+# Two-way ANOVA
+# http://rstudio-pubs-static.s3.amazonaws.com/476761_eb23c47a75d6447688cb793ac8a3e461.html
+
+res.aov2 <- aov(score ~ group + time, data = my_data)
+summary(res.aov2)
+
+# Two-way ANOVA with interaction effect
+# These two calls are equivalent
+res.aov3 <- aov(score ~ group * time, data = my_data)
+res.aov3 <- aov(score ~ group + time + group:time, data = my_data)
+summary(res.aov3)
+
+require("dplyr")
+group_by(my_data, group, time) %>%
+  summarise(
+    count = n(),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE)
+  )
+
+model.tables(res.aov2, type="means", se = TRUE)
+
+TukeyHSD(res.aov2, which = "time")
+
+# 1. Homogeneity of variances
+plot(res.aov3, 1)
+
+library(car)
+leveneTest(score ~ group*time, data = my_data)
+
+# 2. Normality
+plot(res.aov3, 2)
+
+# 3. Skewness
+
+#Skewness between -2 and +2 acceptable (George and Malley, 2010). 
+library(moments)
+skewness(my_data$score, na.rm = TRUE)
+
+# Extract the residuals
+aov_residuals <- residuals(object = res.aov3)
+# Run Shapiro-Wilk test
+shapiro.test(x = aov_residuals)
+```
+
+## 10.5. Vaccination response t-test
+```{r}
+# Rotate input file from folder 'input_data_vaccination_response' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_vaccination_response/Vaccination_Salmonella_IgA_BG.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Load the data
+data("genderweight", package = "datarium")
+
+# Show a sample of the data by group
+set.seed(123)
+my_data %>% sample_n_by(group, size = 2)
+
+my_data %>%
+  group_by(group) %>%
+  get_summary_stats(score, type = "mean_sd")
+
+# Save the data in two different vector
+Y_glucan <- my_data %>%
+  filter(group == "Y_Glucan") %>%
+  pull(score)
+Control <- my_data %>%
+  filter(group == "Control") %>%
+  pull(score)
+
+# Compute t-test
+res <- t.test(Y_glucan, Control)
+res
+
+# Levene
+levene_test(score ~ group, data = my_data)
+
+# Compute t-test
+res <- t.test(score ~ group, data = my_data)
+res
+
+stat.test <- my_data %>% 
+  t_test(score ~ group) %>%
+  add_significance()
+stat.test
+
+my_data %>%
+  t_test(score ~ group, detailed = TRUE) %>%
+  add_significance()
+
+my_data %>% cohens_d(score ~ group, var.equal = FALSE)
+
+# Create a box-plot
+bxp <- ggboxplot(
+  my_data, x = "group", y = "score", 
+  ylab = "score", xlab = "Groups", add = "jitter"
+)
+
+# Add p-value and significance levels
+stat.test <- stat.test %>% add_xy_position(x = "group")
+bxp + 
+  stat_pvalue_manual(stat.test, tip.length = 0) +
+  labs(subtitle = get_test_label(stat.test, detailed = TRUE))
+```
+
+## 10.6. Vaccination resp. - ANOVA
+Vaccination response - two-way ANOVA
+```{r}
+# Rotate input file from folder 'input_data_vaccination_response' to perform the analysis for other immunological parameters:
+my_data <- read.table("./input_data_vaccination_response/Vaccination_Salmonella_IgA_BG.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+my_data$id <- as.factor(my_data$id)
+
+my_data$group <- as.factor(my_data$group)
+
+my_data$time <- as.factor(my_data$time)
+
+# Inspect some random rows of the data by groups
+set.seed(123)
+my_data %>% sample_n_by(group, time, size = 1)
+
+#Extreme outliers are removed from the analysis. 
+
+my_data %>%
+  group_by(time) %>%
+  identify_outliers(score)
+
+#Jitter
+
+my_data$group <- factor(my_data$group, levels = c("Control", "Y_Glucan", "Control_med", "Y_glucan_med"))
+
+my_data %>%
+  filter(group %in% c("Control", "Y_glucan", "Control_med", "Y_glucan_med" )) %>%
+  ggplot(aes(x=time, y=score, fill = factor(group))) +
+  geom_boxplot() + 
+  labs(fill="group") +
+  scale_fill_manual(values = c("#E69F00", "#669966", "#CCCCCC", "#999999")) +
+  geom_point(position=position_jitterdodge(),alpha=0.5, size = 5)
+
+# Two-way ANOVA
+# http://rstudio-pubs-static.s3.amazonaws.com/476761_eb23c47a75d6447688cb793ac8a3e461.html
+
+res.aov2 <- aov(score ~ group + time, data = my_data)
+summary(res.aov2)
+
+# Two-way ANOVA with interaction effect
+# These two calls are equivalent
+res.aov3 <- aov(score ~ group * time, data = my_data)
+res.aov3 <- aov(score ~ group + time + group:time, data = my_data)
+summary(res.aov3)
+
+require("dplyr")
+group_by(my_data, group, time) %>%
+  summarise(
+    count = n(),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE)
+  )
+
+model.tables(res.aov2, type="means", se = TRUE)
+
+TukeyHSD(res.aov2, which = "time")
+
+# 1. Homogeneity of variances
+plot(res.aov3, 1)
+
+library(car)
+leveneTest(score ~ group*time, data = my_data)
+
+# 2. Normality
+plot(res.aov3, 2)
+
+# 3. Skewness
+
+#Skewness between -2 and +2 acceptable (George and Malley, 2010). 
+library(moments)
+skewness(my_data$score, na.rm = TRUE)
+
+# Extract the residuals
+aov_residuals <- residuals(object = res.aov3)
+# Run Shapiro-Wilk test
+shapiro.test(x = aov_residuals)
+```
+
+# 11. Correlation plot
+## 11.1. Prepare data
+```{r}
+ile <- readRDS("./phyobjects/ps1.decontam.rds")
+ile <- subset_samples(ile, Day_of_study_factor == "Day_27")
+ile <- subset_samples(ile, Origin == "ileum_digesta")
+ile <- microbiome::aggregate_taxa(ile, "Genus")
+ile.r <- microbiome::transform(ile, "compositional")
+#Prevalence filter:
+ile.r <- filter_taxa(ile.r, function(x) sum(x > 0.001) > (0.50*length(x)), TRUE)
+```
+
+## 11.2. Extract data from phyloseq object
+```{r}
+OTU1 = as(otu_table(ile.r), "matrix")
+# transpose if necessary
+if(taxa_are_rows(ile.r)){OTU1 <- t(OTU1)}
+# Coerce to data.frame
+OTUdf = as.data.frame(OTU1)
+write.csv(OTUdf, file = "./output_data/OTUdf_all_treatments_day27_ileum_genera_filter_sum0.001_prev0.5.csv") #this file was used to manually combine genera abundances with day 27 ileum sample data
+```
+
+## 11.3. Import ileum data file
+```{r}
+my_data <- read.table("./input_data/ileum_metadata_plus_genera_abundances_for_correlation_figure.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+my_data <- my_data
+head(my_data, 6)
+
+# Summary of data
+summary(my_data)
+
+# Turn into numeric value
+my_data$cdc2_8086_MLN_d27<- as.numeric(my_data$cdc2_8086_MLN_d27)
+
+str(my_data)
+```
+
+## 11.4. Create correlation plot
+```{r}
+# P.adjust: Calculated using Benjamini-Hockberg (BH) method
+cors<-cor(my_data)
+cor.mtest <- function(mat, conf.level = 0.95) {
+  mat <- as.matrix(mat)
+  n <- ncol(mat)
+  p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+  diag(p.mat) <- 0
+  diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+      p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+      lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+      uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+    }
+  }
+  return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+res1 <- cor.mtest(my_data, 0.95)
+
+#You can vectorize your p-value matrix (e.g. res1), which has been returned by cor.mtest function. Afterwards, p.adjust function is  used to get the adjusted p-values.
+pAdj <- p.adjust(c(res1[[1]]), method = "BH")
+#Then create the original matrix with adjusted p-values.
+resAdj <- matrix(pAdj, ncol = dim(res1[[1]])[1])
+#Then the corrplot function is used to create the plot containing adjusted p-values.
+corrplot(cors, p.mat = resAdj, tl.col = "black", sig.level=0.05, insig="blank", cl.align="r", tl.cex=0.6, order="original", na.label="square", na.label.col = "white", type="lower", tl.srt=60, cl.ratio=0.1)
+
+# Save as pdf
+pdf("./figures/Correlation_plot.pdf", width=10, height=10)
+corrplot(cors, p.mat = resAdj, sig.level=0.05, insig="blank", cl.align="r", tl.cex=0.6, order="original", na.label="square", na.label.col = "white", tl.col = "black", type="lower", tl.srt=60, cl.ratio=0.1)
+dev.off() #The final figure can be found as Supplementary Figure S9 of the manuscript
+```
+
+# 12. pH Boxplot
+ 
+Figure was generated using code below, and was then manually exported. This is why it is not showing up in the 'figures' folder. The unprocessed figure can be found under its individual folder.
+
+## 12.1. Import and prepare data
+```{r}
+my_data <- read.table("./input_data/pH_of_GI_segments.csv",
+                      header = TRUE,
+                      sep = ",",
+                      stringsAsFactors = FALSE)
+
+# Convert 'id', 'group', 'time' and 'treatment' to factors: 
+
+my_data$id <- as.factor(my_data$id)
+my_data$group <- factor(my_data$group, levels = c("jejunum", "ileum", "caecum", "colon"))
+my_data$time <- as.factor(my_data$time)
+my_data$treatment <- as.factor(my_data$treatment)
+```
+
+## 12.2. Create boxplot
+```{r}
+p <- ggplot(my_data, aes(x=time, y=score, fill = factor(group))) +  
+  geom_boxplot(outlier.shape = NA) + scale_fill_brewer(palette="PRGn") +   labs(fill="group")
+p <- p + geom_point(position=position_jitterdodge(jitter.width = 0.2), aes(fill = factor(group), shape=treatment), alpha=0.7, size = 3) 
+p
+```
+
+# 13. R version and Packages used
+```{r}
+version
+sessionInfo()
+```
